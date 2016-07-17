@@ -1,10 +1,13 @@
+#ifdef __linux__
 #include <seccomp.h>
+#endif
 #include <errno.h>
 #include <stdlib.h>
 
 #include "birk.h"
 #include "sandbox.h"
 
+#if defined(__linux__)
 int sandbox_enter() {
 	int calls[] ={
 		SCMP_SYS(brk),
@@ -52,3 +55,13 @@ fail:
 
 	return ret;
 }
+
+#elif defined(__FreeBSD__)
+
+#error "NYI"
+
+#else
+
+#error "NYI"
+
+#endif
