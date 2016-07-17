@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "interp.h"
+#include "birk.h"
 #include "test.h"
 
 int main() {

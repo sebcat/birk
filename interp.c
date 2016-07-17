@@ -6,6 +6,7 @@
 #include <assert.h>
 
 #include "interp.h"
+#include "birk.h"
 
 #define BIRK_ERRSZ	512
 
@@ -73,6 +74,19 @@ int interp_load(interp_t *interp, const char *modname) {
 		return BIRK_ERROR;
 	} else {
 		lua_setglobal(interp->L, modname);
+	}
+
+	return BIRK_OK;
+}
+
+int interp_eval(interp_t *interp, const char *code) {
+	assert(interp != NULL);
+	assert(interp->L != NULL);
+	assert(code != NULL);
+
+	if (luaL_dostring(interp->L, code) != LUA_OK) {
+		BIRK_LOADERR(interp);
+		return BIRK_ERROR;
 	}
 
 	return BIRK_OK;
