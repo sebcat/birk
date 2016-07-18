@@ -4,10 +4,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define EXPECT(stmt, errstr) \
+#define EXPECT(stmt, fmt, ...) \
 	do {\
 		if (!(stmt)) { \
-			fprintf(stderr, "%s:%d -> %s\n", __FILE__, __LINE__, errstr); \
+			fprintf(stderr, "%s:%d -> " fmt "\n" , __FILE__, __LINE__, ##__VA_ARGS__); \
 			exit(EXIT_FAILURE); \
 		} \
 	} while(0)

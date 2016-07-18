@@ -48,6 +48,7 @@ interp_t *interp_new() {
 	luaopen_debug(interp->L);
 	luaopen_package(interp->L);
 	/* not opened: io, os */
+	interp_load(interp, "birk");
 	return interp;
 }
 
