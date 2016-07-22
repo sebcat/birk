@@ -58,7 +58,18 @@ fail:
 
 #elif defined(__FreeBSD__)
 
-#error "NYI"
+#include <stdio.h>
+#include <sys/capsicum.h>
+
+int sandbox_enter() {
+	if (cap_enter() == -1) {
+		return BIRK_ERROR;
+	}
+
+	/* TODO: limit open fds capabilities */
+
+	return BIRK_OK;
+}
 
 #else
 
