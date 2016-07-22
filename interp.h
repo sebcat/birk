@@ -1,7 +1,7 @@
 #ifndef __BIRK_INTERP_H
 #define __BIRK_INTERP_H
 
-typedef struct interp_t interp_t;
+typedef struct interp interp_t;
 
 interp_t *interp_new();
 void interp_free(interp_t *interp);

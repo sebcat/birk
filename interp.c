@@ -19,10 +19,10 @@
 	} while(0)
 
 
-typedef struct interp_t {
+struct interp {
 	lua_State *L;
 	char err[BIRK_ERRSZ];
-} interp_t;
+};
 
 interp_t *interp_new() {
 	interp_t *interp;
@@ -42,7 +42,9 @@ interp_t *interp_new() {
 	luaopen_coroutine(interp->L);
 	luaopen_table(interp->L);
 	luaopen_string(interp->L);
+#if (LUA_VERSION_NUM >= 503)
 	luaopen_utf8(interp->L);
+#endif
 	luaopen_bit32(interp->L);
 	luaopen_math(interp->L);
 	luaopen_debug(interp->L);
