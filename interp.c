@@ -70,6 +70,7 @@ int interp_load(interp_t *interp, const char *modname) {
 	assert(interp->L != NULL);
 	assert(modname != NULL);
 
+	interp->err[0] = '\0';
 	lua_getglobal(interp->L, "require");
 	lua_pushstring(interp->L, modname);
 	if (lua_pcall(interp->L, 1, 1, 0) != LUA_OK) {
@@ -87,6 +88,7 @@ int interp_eval(interp_t *interp, const char *code) {
 	assert(interp->L != NULL);
 	assert(code != NULL);
 
+	interp->err[0] = '\0';
 	if (luaL_dostring(interp->L, code) != LUA_OK) {
 		BIRK_LOADERR(interp);
 		return BIRK_ERROR;
