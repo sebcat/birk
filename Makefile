@@ -2,8 +2,11 @@ all: birk-agent test
 
 CC?=clang
 RM?=rm -f
-CFLAGS=-Wall -Werror -O1 -g
-LDFLAGS=-llua -lseccomp
+# lua-5.2 instead of lua-5.3 because there's currently (2016-07-22) no
+# lua53-lpeg in the ports tree
+CFLAGS=-Wall -Werror -O1 -g -I/usr/local/include/lua52/
+LDFLAGS=-L/usr/local/lib -llua-5.2
+
 
 .PHONY: test
 
