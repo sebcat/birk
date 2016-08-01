@@ -17,8 +17,8 @@ end
 -- Initializes a connection in the parent process. Connections are established
 -- asyncronously by the parent and the interpreter is notified on success or
 -- failure
-function birk.connect_tcp(host,port)
-  return ipc:connect_tcp(host,port)
+function birk.connect(host,port)
+  return ipc:connect(host,port)
 end
 
 ipc:ready() -- tell parent we're done loading
