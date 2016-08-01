@@ -9,7 +9,7 @@ int main() {
 
 	setenv("LUA_PATH", "?/init.lua;?.lua;?", 1);
 	interp_free(NULL); /* should not crash */
-	interp = interp_new();
+	interp = interp_new(0, -1);
 	EXPECT(*interp_errstr(interp) == '\0',
 			"%s", interp_errstr(interp));
 	EXPECT(interp != NULL, "interp was NULL");
