@@ -11,16 +11,19 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <limits.h>
+#include <assert.h>
+#include <netdb.h>
 
 #include "interp.h"
 #include "sandbox.h"
 #include "birk.h"
+#include "ipc.h"
 
 /* option flags */
 #define OPT_NOSANDBOX	(1 << 0)
 
 /* default maximum number of sequential sandbox reloads */
-#define DFL_MAXRETRIES	2
+#define DFL_MAXRETRIES	1
 /* default RLIMIT_NOFILE limit, set in parent */
 #define DFL_MAXFDS		10
 /* default RLIMIT_AS limit, set in parent */
@@ -32,6 +35,199 @@ struct options {
 	int maxfds;
 	long vaddrlim;
 };
+
+struct childctx {
+	struct timeval started;
+	pid_t pid;
+	int fd;
+	int nretries;
+};
+
+static int child_event_loop(interp_t *interp, int parentfd) {
+	char buf[2048];
+	struct timeval tv;
+	fd_set rfds;
+	int ret, maxfd, stdin_fileno;
+
+	stdin_fileno = fileno(stdin);
+	while(1) {
+
+		/* receive messages (if any) from the parent */
+		maxfd = parentfd > stdin_fileno ? parentfd : stdin_fileno;
+		FD_ZERO(&rfds);
+		FD_SET(parentfd, &rfds);
+		FD_SET(stdin_fileno, &rfds);
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+		ret = select(maxfd+1, &rfds, NULL, NULL, &tv);
+		if (ret < 0 && errno != EINTR) {
+			perror("select");
+			break;
+		} else if (ret > 0) {
+			if (FD_ISSET(parentfd, &rfds)) {
+				/* TODO: handle message from parent */
+			} else if (FD_ISSET(stdin_fileno, &rfds)) {
+				/*XXX: assumes line buffered STDIN */
+				if (fgets(buf, sizeof(buf)-1, stdin) == NULL) {
+					break;
+				} else if (interp_eval(interp, buf) != BIRK_OK) {
+					fprintf(stderr, "%s\n", interp_errstr(interp));
+				}
+				/* TODO: interp_print for printing the result
+				 * making it an actual REPL? */
+			}
+		}
+	}
+
+	return EXIT_FAILURE;
+}
+
+static int start_interp_proc(struct options *opts, struct childctx *chld) {
+	interp_t *interp = NULL;
+	pid_t pid = -1;
+	int pair[2], ret;
+
+	if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) {
+		perror("socketpair");
+		return BIRK_ERROR;
+	}
+
+	gettimeofday(&chld->started, NULL);
+	if ((pid = fork()) < 0) {
+		perror("fork");
+		return BIRK_ERROR;
+	} else if (pid > 0) {
+		close(pair[0]);
+		chld->fd = pair[1];
+		chld->pid = pid;
+		return BIRK_OK;
+	} else /* pid == 0 */ {
+		close(pair[1]);
+		signal(SIGCHLD, SIG_DFL);
+		signal(SIGUSR1, SIG_DFL);
+
+		/* we load the interpreter early on so that
+		 * we can initialize things outside of the sandbox. This
+		 * assumes that we consider the code to be trusted */
+		interp = interp_new(INTERPF_LOADBIRK, pair[0]);
+		if (interp == NULL) {
+			perror("interp_new");
+			exit(EXIT_FAILURE);
+		} else if (*interp_errstr(interp) != '\0') {
+			fprintf(stderr, "%s\n", interp_errstr(interp));
+			exit(EXIT_FAILURE);
+		}
+
+		if (opts->flags & OPT_NOSANDBOX) {
+			fprintf(stderr, "Warning: sandbox disabled\n");
+		} else {
+			if (sandbox_enter() != BIRK_OK) {
+				perror("sandbox_enter");
+				exit(EXIT_FAILURE);
+			}
+		}
+
+		/* we don't pass on option data to the event loop.
+		 * If option data is to be present further on, it
+		 * should be made accessible through the interpreter */
+		ret = child_event_loop(interp, pair[0]);
+		close(pair[0]);
+		interp_free(interp);
+		exit(ret);
+	}
+
+	return ret;
+}
+
+/* parent signal handler */
+#define _CHILD_DEAD	(1<<0) /* SIGCHLD passed to signal handler */
+#define _CHILD_KILL (1<<1) /* SIGUSR1 passed to signal handler */
+static volatile sig_atomic_t _child_status = 0;
+static void child_handler(int sig, siginfo_t *si, void *arg) {
+	if (sig == SIGCHLD) {
+		_child_status |= _CHILD_DEAD;
+	} else if (sig == SIGUSR1) {
+		_child_status |= _CHILD_KILL;
+	}
+}
+
+static void handle_message_from_child(struct ipcmsg *msg, struct childctx *chld) {
+	struct timeval now;
+
+	switch (msg->type) {
+		case IPC_CREADY:
+			chld->nretries = 0; /* reset retry counter */
+			gettimeofday(&now, NULL);
+			printf("interpreter started in %ld.%06lds\n",
+					now.tv_sec - chld->started.tv_sec,
+					now.tv_usec - chld->started.tv_usec);
+			break;
+		case IPC_CCONNECT:
+			assert(msg->length > 2);
+			printf("connect\n");
+			// unpack strings from value
+			break;
+	}
+}
+
+static int parent_event_loop(struct options *opts) {
+	struct timeval tv;
+	fd_set rfds;
+	int ret, maxfd;
+	struct childctx chld;
+	struct ipcmsg msg;
+
+	memset(&chld, 0, sizeof(chld));
+	chld.fd = -1;
+	_child_status = _CHILD_DEAD;
+	while(1) {
+
+		/* manage child process status  and reloading w/ retry limit */
+		if (_child_status & _CHILD_DEAD) {
+			_child_status = 0;
+			if (chld.fd >= 0) {
+				close(chld.fd);
+				chld.fd = -1;
+			}
+			while (waitpid(-1, NULL, WNOHANG) > 0);
+			chld.nretries++;
+			if (chld.nretries >= opts->maxretries) {
+				break;
+			} else {
+				if (start_interp_proc(opts, &chld) != BIRK_OK) {
+					break;
+				}
+			}
+		} else if (_child_status & _CHILD_KILL) {
+			kill(chld.pid, SIGKILL);
+		}
+
+		/* receive messages (if any) from the child */
+		maxfd = chld.fd;
+		FD_ZERO(&rfds);
+		FD_SET(chld.fd, &rfds);
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+		ret = select(maxfd+1, &rfds, NULL, NULL, &tv);
+		if (ret < 0 && errno != EINTR) {
+			perror("select");
+			break;
+		} else if (ret > 0) {
+			if (FD_ISSET(chld.fd, &rfds)) {
+				if ((ret = ipc_recvmsg(chld.fd, &msg)) < 0) {
+					perror("ipc_readmsg");
+					break;
+				} else if (ret == 0) {
+					continue;
+				} else {
+					handle_message_from_child(&msg, &chld);
+				}
+			}
+		}
+	}
+
+	return EXIT_FAILURE;
+}
 
 static void usage() {
 	fprintf(stderr,
@@ -106,160 +302,15 @@ static void opts_or_die(struct options *opts, int argc, char *argv[]) {
 				usage();
 		}
 	}
-}
 
-static int child_event_loop(interp_t *interp, int parentfd) {
-	char buf[2048];
-	struct timeval tv;
-	fd_set rfds;
-	int ret, maxfd, stdin_fileno;
-
-	stdin_fileno = fileno(stdin);
-	while(1) {
-
-		/* receive messages (if any) from the parent */
-		maxfd = parentfd > stdin_fileno ? parentfd : stdin_fileno;
-		FD_ZERO(&rfds);
-		FD_SET(parentfd, &rfds);
-		FD_SET(stdin_fileno, &rfds);
-		tv.tv_sec = 1;
-		tv.tv_usec = 0;
-		ret = select(maxfd+1, &rfds, NULL, NULL, &tv);
-		if (ret < 0 && errno != EINTR) {
-			perror("select");
-			break;
-		} else if (ret > 0) {
-			if (FD_ISSET(parentfd, &rfds)) {
-				/* TODO: handle message from parent */
-			} else if (FD_ISSET(stdin_fileno, &rfds)) {
-				/*XXX: assumes line buffered STDIN */
-				if (fgets(buf, sizeof(buf)-1, stdin) == NULL) {
-					break;
-				} else if (interp_eval(interp, buf) != BIRK_OK) {
-					fprintf(stderr, "%s\n", interp_errstr(interp));
-				}
-			}
-		}
-	}
-
-	return EXIT_FAILURE;
-}
-
-static pid_t start_interp_proc(struct options *opts, int *fd) {
-	interp_t *interp = NULL;
-	pid_t pid = -1;
-	int pair[2], ret;
-
-	if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
-		perror("socketpair");
-		return -1;
-	}
-
-	if ((pid = fork()) < 0) {
-		perror("fork");
-		return -1;
-	} else if (pid > 0) {
-		close(pair[0]);
-		*fd = pair[1];
-		return pid;
-	} else /* pid == 0 */ {
-		close(pair[1]);
-		signal(SIGCHLD, SIG_DFL);
-		signal(SIGUSR1, SIG_DFL);
-
-		/* we load the interpreter early on so that
-		 * we can initialize things outside of the sandbox. This
-		 * assumes that we consider the code to be trusted */
-		interp = interp_new();
-		if (interp == NULL) {
-			perror("interp_new");
-			exit(EXIT_FAILURE);
-		} else if (*interp_errstr(interp) != '\0') {
-			fprintf(stderr, "%s\n", interp_errstr(interp));
-			exit(EXIT_FAILURE);
-		}
-
-		if (opts->flags & OPT_NOSANDBOX) {
-			fprintf(stderr, "Warning: sandbox disabled\n");
-		} else {
-			if (sandbox_enter() != BIRK_OK) {
-				perror("sandbox_enter");
-				exit(EXIT_FAILURE);
-			}
-		}
-
-		/* we don't pass on option data to the event loop.
-		 * If option data is to be present further on, it
-		 * should be made accessible through the interpreter */
-		ret = child_event_loop(interp, pair[0]);
-		close(pair[0]);
-		interp_free(interp);
-		exit(ret);
-	}
-
-	return ret;
-}
-
-/* parent signal handler */
-#define _CHILD_DEAD	(1<<0) /* SIGCHLD passed to signal handler */
-#define _CHILD_KILL (1<<1) /* SIGUSR1 passed to signal handler */
-volatile sig_atomic_t _child_status = 0;
-static void child_handler(int sig, siginfo_t *si, void *arg) {
-	if (sig == SIGCHLD) {
-		_child_status |= _CHILD_DEAD;
-	} else if (sig == SIGUSR1) {
-		_child_status |= _CHILD_KILL;
+	/* we start with a dead child, so we will always "retry" one more */
+	opts->maxretries++;
+	if (opts->maxretries <= 0) {
+		fprintf(stderr, "Invalid maxretries option\n");
+		usage();
 	}
 }
 
-static int parent_event_loop(struct options *opts, pid_t chldpid, int chldfd) {
-	struct timeval tv;
-	fd_set rfds;
-	int ret, maxfd, nretries=0;
-
-	while(1) {
-
-		/* receive messages (if any) from the child */
-		maxfd = chldfd;
-		FD_ZERO(&rfds);
-		FD_SET(chldfd, &rfds);
-		tv.tv_sec = 1;
-		tv.tv_usec = 0;
-		ret = select(maxfd+1, &rfds, NULL, NULL, &tv);
-		if (ret < 0 && errno != EINTR) {
-			perror("select");
-			break;
-		} else if (ret > 0) {
-			if (FD_ISSET(chldfd, &rfds)) {
-				/* TODO: read child message, do something with it */
-			}
-		}
-
-		/* manage child process status  and reloading w/ retry limit */
-		if (_child_status & _CHILD_DEAD) {
-			_child_status = 0;
-			close(chldfd);
-			while (waitpid(-1, NULL, WNOHANG) > 0);
-			nretries++;
-			if (nretries >= opts->maxretries) {
-				break;
-			} else {
-				chldpid = start_interp_proc(opts, &chldfd);
-				if (chldpid < 0) {
-					break;
-				}
-			}
-		} else if (_child_status & _CHILD_KILL) {
-			kill(chldpid, SIGKILL);
-		} else {
-			if (nretries > 0) {
-				nretries--;
-			}
-		}
-	}
-
-	return EXIT_FAILURE;
-}
 
 static void rlimits_or_die(struct options *opts) {
 	struct rlimit rlim;
@@ -293,14 +344,11 @@ static void rlimits_or_die(struct options *opts) {
 			exit(EXIT_FAILURE);
 		}
 	}
-
 }
 
 int main(int argc, char *argv[]) {
 	struct options opts;
 	struct sigaction sa;
-	int childfd = -1;
-	pid_t pid;
 
 	/* SIGCHLD signal handler */
 	memset(&sa, 0, sizeof(struct sigaction));
@@ -325,12 +373,5 @@ int main(int argc, char *argv[]) {
 
 	opts_or_die(&opts, argc, argv);
 	rlimits_or_die(&opts);
-
-	/* start the child process running the sandboxed Lua interpreter */
-	if ((pid = start_interp_proc(&opts, &childfd)) < 0) {
-		return EXIT_FAILURE;
-	}
-
-	/* have the parent enter its event loop */
-	return parent_event_loop(&opts, pid, childfd);
+	return parent_event_loop(&opts);
 }
